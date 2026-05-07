@@ -1154,7 +1154,12 @@ code {
   font-size: 13px;
   color: var(--text-muted);
   line-height: 1.55;
-  max-width: 50ch;
+  /* 72ch lets typical one-sentence English subtitles fit on a single
+   * line inside the 920px settings modal while still wrapping cleanly
+   * on narrow viewports (the modal width clamps to 100vw - 48px) and
+   * for the longest locales (German, French). 50ch was forcing even
+   * the English subtitle onto two lines. See nexu-io/open-design#743. */
+  max-width: 72ch;
 }
 .modal-foot {
   display: flex;
@@ -1338,7 +1343,8 @@ code {
   background: var(--accent-tint);
   color: var(--accent-strong);
 }
-.settings-rescan-status {
+.settings-rescan-status,
+.settings-test-status {
   margin: -4px 0 0;
   padding: 7px 10px;
   border: 1px solid var(--green-border);
@@ -1348,10 +1354,38 @@ code {
   font-size: 12px;
   line-height: 1.4;
 }
-.settings-rescan-status.error {
+.settings-rescan-status.error,
+.settings-test-status.error {
   border-color: var(--red-border);
   background: var(--red-bg);
   color: var(--red);
+}
+.settings-test-status.warn {
+  border-color: var(--amber-border, var(--orange-border, var(--green-border)));
+  background: var(--amber-bg, var(--orange-bg, var(--green-bg)));
+  color: var(--amber, var(--orange, var(--green)));
+}
+.settings-test-status.running {
+  border-color: var(--accent-soft);
+  background: var(--accent-tint);
+  color: var(--accent-strong);
+}
+.settings-test-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 64px;
+  justify-content: center;
+}
+.settings-test-btn.loading {
+  border-color: var(--accent-soft);
+  background: var(--accent-tint);
+  color: var(--accent-strong);
+}
+.section-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 .settings-field-error {
   color: var(--red);
