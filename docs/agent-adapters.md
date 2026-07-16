@@ -1,8 +1,10 @@
 # Agent Adapters
 
-**Parent:** [`spec.md`](spec.md) · **Siblings:** [`architecture.md`](architecture.md) · [`skills-protocol.md`](skills-protocol.md) · [`modes.md`](modes.md)
+**Parent:** [`spec.md`](spec.md) · **Siblings:** [`architecture.md`](architecture.md) · [`skills-protocol.md`](skills-protocol.md) · [`new-agent-runtime-acp.md`](new-agent-runtime-acp.md) · [`modes.md`](modes.md)
 
 The adapter layer is OD's most load-bearing design decision. We delegate the **entire agent loop** — model calls, tool use, context management, permission handling, resume, cancel — to the user's existing code agent CLI. OD's job is to detect it, feed it a skill + prompt + working directory, and stream its output back to the web UI.
+
+If you're adding a new ACP-backed runtime, start with [`new-agent-runtime-acp.md`](new-agent-runtime-acp.md) for the expected stdio transport, JSON-RPC message flow, and process lifecycle contract.
 
 > **Thesis:** The code agent space has already converged on a few strong implementations (Claude Code, Codex, Devin for Terminal, Cursor Agent, Gemini CLI, OpenCode, OpenClaw, Qoder CLI). Reimplementing another one is worse than just talking to all of them.
 >
@@ -10,67 +12,103 @@ The adapter layer is OD's most load-bearing design decision. We delegate the **e
 
 ---
 
-## 1. Adapter interface (TypeScript)
+## 1. Adapter contract: a data spec, not a class
 
-Every adapter implements this interface. The current adapter implementation lives in [`apps/daemon/src/agents.ts`](../apps/daemon/src/agents.ts).
+An adapter is **not** a class that implements the agent loop. It is a **plain data object** — one `RuntimeAgentDef` object literal per CLI — that declares *how to talk to* that CLI: which binary to probe, how to build its argv, how it streams, what it can do. A **generic engine** reads those fields and does the detecting, launching, invoking, and stream-parsing for every agent uniformly. There is no per-agent subclass and no `run()` / `cancel()` method to implement.
+
+Where the pieces live (all under `apps/daemon/src/`):
+
+- **The contract (the data spec):** [`runtimes/types.ts`](../apps/daemon/src/runtimes/types.ts) — the `RuntimeAgentDef` type.
+- **One def per CLI:** [`runtimes/defs/*.ts`](../apps/daemon/src/runtimes/defs) — `claude.ts`, `codex.ts`, `cursor-agent.ts`, `devin.ts`, … each exports a single object literal.
+- **The registry (a unique-id array):** [`runtimes/registry.ts`](../apps/daemon/src/runtimes/registry.ts) — `BASE_AGENT_DEFS` collects every def into `AGENT_DEFS`; a boot-time loop throws on any duplicate `id`.
+- **The generic engine (zero per-agent code):** `detection.ts`, `capabilities.ts`, `executables.ts` / `resolution.ts`, `launch.ts`, `invocation.ts`, `env.ts`, `mcp.ts`, `models.ts`, `prompt-budget.ts` under `runtimes/`, plus the stream dispatch in [`server.ts`](../apps/daemon/src/server.ts) that routes each def's `streamFormat` / `eventParser` to the matching `*-stream.ts` parser.
+- **The public barrel:** [`agents.ts`](../apps/daemon/src/agents.ts) re-exports `AGENT_DEFS`, `getAgentDef`, `detectAgents`, `resolveAgentLaunch`, … from `runtimes/`. It defines nothing itself — import from it for convenience, but read `runtimes/` for the contract.
+
+> **Adding a CLI is a one-file change.** Drop a new `runtimes/defs/<cli>.ts` exporting one `RuntimeAgentDef`, add it to the `BASE_AGENT_DEFS` array in `registry.ts`, and the engine detects, launches, invokes, and (for an existing `streamFormat`) streams it — **no engine edits, no new class, no method overrides.** The def is config; the loop is shared. A genuinely new wire format is the only case that also adds an engine file (a new `*-stream.ts` and a `streamFormat` value).
+
+### The data spec (`RuntimeAgentDef`, abbreviated)
+
+The full type lives in `runtimes/types.ts`; the load-bearing fields:
 
 ```ts
-interface AgentAdapter {
-  readonly id: string;                      // "claude-code" | "codex" | …
-  readonly displayName: string;
+type RuntimeAgentDef = {
+  id: string;                 // unique key, e.g. "claude" | "codex" — the registry dedupes on it
+  name: string;               // display name
+  bin: string;                // CLI executable to probe on PATH
+  fallbackBins?: string[];    // alternate executable names
+  versionArgs: string[];      // args for the version / detection probe
+  fallbackModels: RuntimeModelOption[];
 
-  // -- discovery --------------------------------------------------
-  detect(): Promise<AgentDetection | null>; // null if not installed
+  // How to invoke: build the argv for one turn from the composed prompt.
+  buildArgs: (
+    prompt: string,
+    imagePaths: string[],
+    extraAllowedDirs?: string[],
+    options?: RuntimeBuildOptions,
+    runtimeContext?: RuntimeContext,
+  ) => string[];
 
-  // -- capability negotiation ------------------------------------
-  capabilities(): AgentCapabilities;
+  // How it talks back: the engine dispatches these to the matching parser.
+  streamFormat: string;               // e.g. "claude-stream-json" | "acp-json-rpc" | "plain"
+  eventParser?: string;               // named parser, e.g. "codex" | "cursor-agent" | "opencode"
 
-  // -- execution -------------------------------------------------
-  run(params: AgentRunParams): AsyncIterable<AgentEvent>;
-  cancel(runId: string): Promise<void>;
-  resume?(runId: string, message: string): AsyncIterable<AgentEvent>;
-}
+  // How the prompt is delivered.
+  promptViaStdin?: boolean;
+  promptViaFile?: boolean;
+  promptInputFormat?: 'text' | 'stream-json';
 
-interface AgentDetection {
-  executablePath: string;                   // absolute path to CLI
-  version: string;
-  configDir?: string;                       // e.g. ~/.claude
-  skillsDir?: string;                       // e.g. ~/.claude/skills
-  authState: "ok" | "missing" | "expired";
-}
-
-interface AgentCapabilities {
-  surgicalEdit: boolean;                    // can edit a targeted region without rewriting file
-  nativeSkillLoading: boolean;              // picks up ~/.<agent>/skills/ automatically
-  streaming: boolean;                       // emits tool calls in real time
-  resume: boolean;                          // can continue an interrupted run
-  permissionMode: "strict" | "permissive" | "none";
-  contextWindowHint?: number;               // in tokens
-}
-
-interface AgentRunParams {
-  runId: string;
-  cwd: string;                              // absolute path — artifact dir
-  systemPrompt: string;                     // skill's SKILL.md body + DESIGN.md excerpt
-  userPrompt: string;
-  skillDir?: string;                        // if set, adapter should make skill files available
-  allowedTools?: string[];                  // for agents that support it
-  timeoutMs?: number;
-}
-
-type AgentEvent =
-  | { type: "thinking"; text: string }
-  | { type: "tool_call"; name: string; input: unknown; id: string }
-  | { type: "tool_result"; id: string; output: unknown }
-  | { type: "text_delta"; text: string }
-  | { type: "file_write"; path: string }   // synthesized by adapter if agent doesn't emit natively
-  | { type: "error"; error: string }
-  | { type: "done"; reason: "completed" | "cancelled" | "error" };
+  // Optional capability / integration declarations (all data, no behavior).
+  supportsImagePaths?: boolean;
+  externalMcpInjection?: 'claude-mcp-json' | 'acp-merge' | 'opencode-env-content';
+  authProbe?: { args: string[]; timeoutMs?: number };
+  listModels?: RuntimeListModels;     // dynamic model discovery
+  // …~30 more optional fields, every one data or a pure arg-builder.
+};
 ```
+
+Every field is **data or a pure arg-builder** — there is no `run()`, no `cancel()`, no subclass. Capabilities, detection, cancellation, and streaming are the engine's job, driven off these declarations, which is why a new agent needs only a new object rather than a new code path.
+
+### A concrete def (shape)
+
+```ts
+// runtimes/defs/acme.ts (illustrative — a made-up CLI, not a shipped def)
+export const acmeAgentDef: RuntimeAgentDef = {
+  id: 'acme',
+  name: 'Acme CLI',
+  bin: 'acme',
+  versionArgs: ['--version'],
+  fallbackModels: [{ id: 'acme-pro', label: 'Acme Pro' }],
+  streamFormat: 'claude-stream-json',   // reuse an existing parser — no engine change
+  promptViaStdin: true,
+  buildArgs: (prompt, imagePaths, extraDirs, opts) => [
+    '--output-format', 'stream-json',
+    /* … */
+  ],
+};
+```
+
+### The registry (a unique-id array)
+
+```ts
+// runtimes/registry.ts
+const BASE_AGENT_DEFS: RuntimeAgentDef[] = [
+  claudeAgentDef, codexAgentDef, devinAgentDef, cursorAgentDef,
+  /* … one entry per CLI (roughly two dozen today) … */
+];
+
+// boot-time invariant: no two defs may share an id
+const ids = new Set<string>();
+for (const def of AGENT_DEFS) {
+  if (ids.has(def.id)) throw new Error(`Duplicate agent definition id: ${def.id}`);
+  ids.add(def.id);
+}
+```
+
+`AGENT_DEFS` = `BASE_AGENT_DEFS` plus any user-defined local profiles (`readLocalAgentProfileDefs`), and `getAgentDef(id)` is the lookup the rest of the daemon uses. The event set the `*-stream.ts` parsers emit onto the UI stream (thinking / tool-call / tool-result / text-delta / file-write / error / done) is defined by those parsers, not by the def — see §11 for where they live and `server.ts` for the dispatch.
 
 ## 2. Detection strategy
 
-Run all adapters' `detect()` in parallel on daemon start, then cache results in `~/.open-design/agents.json` with a 24h TTL. Re-detect on daemon `SIGHUP`.
+Run all adapters' `detect()` in parallel on daemon start, then cache results through daemon-managed storage with a 24h TTL. This document MUST NOT define daemon data paths; read the root `AGENTS.md` section **Daemon data directory contract** before changing or documenting that storage.
 
 Each adapter uses **two signals**:
 
@@ -84,6 +122,7 @@ If both signals agree, detection is confident. If only one signal fires, we mark
 | Adapter | CLI command | Config dir | Skills dir | Native skill loading | Surgical edit | Streaming | Priority |
 |---|---|---|---|---|---|---|---|
 | **claude-code** | `claude` | `~/.claude/` | `~/.claude/skills/` | ✅ | ✅ | ✅ | P0 (MVP) |
+| **amp** | `amp` | `~/.config/amp/` | n/a (via `amp skill add`) | ❌ (prompt-injected) | ✅ | ✅ (`-x --stream-json`, Claude-compatible) | P2 |
 | **api-fallback** | *(direct Anthropic API)* | — | — | ❌ (prompt-injected) | 〜 | ✅ | P0 (MVP) |
 | **codex** | `codex` | `~/.codex/` | `~/.codex/skills/` | 〜 (varies by version) | 〜 (regenerate w/ scoping) | ✅ | P1 |
 | **devin** | `devin` | `~/.config/devin/` | `~/.config/devin/skills/` | ✅ | ✅ | ✅ (`acp-json-rpc`) | P1 |
@@ -95,6 +134,7 @@ If both signals agree, detection is confident. If only one signal fires, we mark
 | **kiro** | `kiro-cli` | `~/.kiro/` | ❌ | ✅ | ✅ (`acp-json-rpc`) | P2 |
 | **kilo** | `kilo` | — | ❌ | ✅ | ✅ (`acp-json-rpc`) | P2 |
 | **vibe** | `vibe-acp` | `~/.vibe/` | ❌ | ✅ | ✅ (`acp-json-rpc`) | P2 |
+| **trae-cli** | `traecli` | Trae CLI config | Trae CLI managed | ❌ (prompt-injected) | ✅ | ✅ (`acp-json-rpc`) | P2 |
 | **deepseek** | `deepseek` | `~/.deepseek/` | `~/.deepseek/skills/` | ❌ (prompt-injected) | ✅ | ✅ (plain text) | P2 |
 | **qoder** | `qodercli` | Qoder CLI config | Qoder CLI managed | ❌ (prompt-injected) | ✅ | ✅ (`stream-json`) | P2 |
 | **pi** | `pi` | `~/.pi/agent/` | `~/.pi/agent/skills/` | ❌ (prompt-injected) | ✅ | ✅ (`pi-rpc` JSON-RPC) | P2 |
@@ -191,6 +231,7 @@ The adapter declares which strategy to use via `capabilities().nativeSkillLoadin
 ### 5.7 OpenCode / OpenClaw
 
 - Less-matured CLIs. Targeting P2. Expect bumps; adapter implementations will likely be the thinnest possible "shell out, parse output, synthesize events" approach.
+- OpenCode runs as `opencode run --format json` with the prompt on stdin. Newer OpenCode builds that advertise `--dangerously-skip-permissions` from `opencode run --help` receive that flag so headless runs do not stop on edit approval prompts; older builds keep the 1.3-compatible argv.
 
 ### 5.8 GitHub Copilot CLI
 
@@ -209,6 +250,15 @@ The adapter declares which strategy to use via `capabilities().nativeSkillLoadin
 - Permission: `--permission-mode bypass_permissions` avoids headless approval prompts in the web UI. Users should treat this as the same trust posture as running Qoder directly with that flag in the selected project directory.
 - **Gotcha:** Detection only proves `qodercli --version` can run. Qoder authentication and account scope remain owned by Qoder CLI, with credentials read from Qoder's `~/.qoder/config.json`; the daemon surfaces stderr/stdout failures from the spawned run instead of running login or editing Qoder config.
 
+### 5.10 Trae CLI
+
+- Invocation: `traecli acp serve --yolo`, using the daemon's shared ACP JSON-RPC transport. The adapter follows Trae CLI's public ACP entrypoint documented at https://www.volcengine.com/docs/86677/2227861?lang=zh.
+- Streaming: `acp-json-rpc`; the daemon uses the same ACP event path as the other ACP-backed adapters.
+- Models: dynamic via the ACP handshake. If model discovery fails, the picker falls back to the CLI's default configuration rather than requiring CI or startup detection to log in to Trae CLI.
+- Skills: prompt injection only in v1. External MCP servers can be forwarded through the ACP launch descriptor with the existing `acp-merge` path.
+- Permission: `--yolo` avoids headless approval prompts in the web UI. This follows the adapter catalog's existing non-interactive permission posture for CLIs such as Devin, Copilot, Qoder, and DeepSeek: the daemon runs agent CLIs without a TTY, so it must not rely on an interactive tool-approval prompt to make progress.
+- **Gotcha:** Detection only proves `traecli --version` and model discovery can run in the current environment. Trae CLI owns login, account scope, and model entitlement; the daemon does not run login flows or edit Trae CLI configuration.
+
 ### 5.11 Pi
 
 - Invocation: `pi --mode rpc [--model <id>] [--thinking <level>] [--append-system-prompt <dir> …]`, with the composed prompt delivered over stdin via JSON-RPC. The daemon sends a `prompt` command (optionally with `images` for multimodal input) and pi streams back typed events until `agent_end`. Pi's RPC process stays alive after `agent_end` (designed for multi-prompt sessions); the daemon closes stdin and SIGTERMs after a grace period since `/api/chat` is single-shot.
@@ -220,7 +270,7 @@ The adapter declares which strategy to use via `capabilities().nativeSkillLoadin
 - Extension UI: auto-resolved. pi's RPC protocol can request user dialogs (`select`, `confirm`, `input`, `editor`) and fire-and-forget notifications (`setStatus`, `setWidget`, `notify`, `setTitle`, `set_editor_text`). Dialog methods are auto-approved (confirm → true, select → first option) and fire-and-forget methods are silently consumed because the web UI has no surface for them.
 - **Gotcha:** pi's RPC `prompt` response is asynchronous — `success: true` only means the prompt was accepted, not that the agent finished. Agent failures after acceptance surface through the normal event stream (`extension_error`, `auto_retry_end` with `success: false`) and the empty-output guard.
 
-### 5.10 DeepSeek TUI
+### 5.12 DeepSeek TUI
 
 - Invocation: `deepseek exec --auto [--model <id>] "<prompt>"`. The `deepseek` dispatcher owns the `exec` / `--auto` subcommands and delegates to a sibling `deepseek-tui` runtime binary at exec time; upstream documents both binaries as required (the npm and cargo paths install them together). We only probe the dispatcher — `deepseek-tui` on its own doesn't accept this argv shape, so advertising it as a fallback would surface the agent as available but fail on the first chat run. A future revision could teach resolution + buildArgs which binary was selected and emit a verified `deepseek-tui` invocation, with a regression test exercising that path.
 - Streaming: plain text deltas to stdout in non-`--json` mode (tool-call notifications go to stderr). Skipping `--json` is intentional — `deepseek exec --json` batches the entire run into one trailing summary object instead of streaming, which would freeze the chat UI until end-of-turn.
@@ -229,6 +279,28 @@ The adapter declares which strategy to use via `capabilities().nativeSkillLoadin
 - Prompt delivery: positional argv (no stdin sentinel; clap declares `prompt: String` as a required field). This means very large composed prompts can hit Windows' ~32 KB `CreateProcess` limit; for typical chat prompts this is non-issue. Upstream support for a `-` stdin sentinel would let us flip this to `promptViaStdin: true` like the other adapters. To avoid surfacing oversized prompts as a generic `spawn ENAMETOOLONG` / `E2BIG`, the adapter declares `maxPromptArgBytes` (currently 30,000) and `/api/chat` enforces it through three complementary guards: a fast pre-bin-resolution `checkPromptArgvBudget` against the raw composed prompt bytes, a post-`buildArgs` `checkWindowsCmdShimCommandLineBudget` that — when the resolved binary is a Windows `.cmd` / `.bat` shim — recomputes the would-be `cmd.exe /d /s /c "<inner>"` command line using the same per-arg quote-doubling the platform layer applies on Windows, and a sibling `checkWindowsDirectExeCommandLineBudget` that — when the resolved binary is a non-shim Windows install (e.g. a cargo-built `deepseek.exe`) — recomputes the same command line using libuv's `quote_cmd_arg` rules (every `"` becomes `\"`, backslashes adjacent to a quote are doubled). The two Windows guards are mutually exclusive on a given resolution: the cmd-shim guard owns `.cmd`/`.bat`, the direct-exe guard owns everything else. Together they catch quote-heavy prompts (code blocks, JSON-shaped skill seeds) that fit under the raw byte budget but expand past CreateProcess's 32_767-char `lpCommandLine` cap on either install path. All three guards emit the same actionable `AGENT_PROMPT_TOO_LARGE` SSE error telling the user to reduce skills/design-system context, shorten the conversation, or pick an adapter with stdin support, and all three are unit-tested (oversized + short-prompt branches, quote-heavy regressions for both Windows paths, and a mutual-exclusivity check) so the guards can't silently regress.
 - Models: ships `deepseek-v4-pro` and `deepseek-v4-flash` as fallback hints (1M-token context windows, native thinking-mode streaming). Users can paste any other id (e.g. `nvidia-nim/deepseek-v4-pro`, `fireworks/deepseek-v4-flash`) via the Settings dialog's custom-model input.
 - **Gotcha — auth state is not auto-detected.** DeepSeek TUI reads its API key from `~/.deepseek/config.toml` or `DEEPSEEK_API_KEY`. If the user hasn't run `deepseek auth set --provider deepseek` (or set the env var), the first run errors out with a non-actionable message. Detection currently only reports `available: true` based on the binary being on PATH; surface auth state via `deepseek doctor --json` in a follow-up.
+
+### 5.13 Plain stream artifact handoff
+
+Adapters with `streamFormat: 'plain'` do not expose structured file-write tool calls to the daemon. Their stdout is still a valid artifact handoff when the model emits Anthropic-style source blocks:
+
+```html
+<artifact identifier="landing-page" type="text/html" title="Landing page">
+<!doctype html>
+<html>...</html>
+</artifact>
+```
+
+At run completion, the daemon scans the captured plain stdout for `<artifact>` blocks with supported text types and writes them through the normal project artifact path:
+
+| Artifact type | Project file |
+|---|---|
+| `text/html` or `html` | `<identifier>.html` |
+| `text/css` or `css` | `<identifier>.css` |
+| `image/svg+xml` or `svg` | `<identifier>.svg` |
+| `text/markdown`, `text/x-markdown`, `markdown`, or `md` | `<identifier>.md` |
+
+The identifier is slugged before use, collisions receive `-2`, `-3`, etc., and outputs without a supported `<artifact>` block are left unchanged. This daemon-side extraction keeps headless runs and web-attached runs aligned: the project file exists even when no browser is present to parse the chat stream.
 
 ## 6. Capability-driven UI
 
@@ -297,25 +369,45 @@ The daemon never grants more authority to an agent than it had on its own. We do
 
 ## 11. Adapter source layout
 
+The contract, the per-CLI defs, and the stream parsers live under `apps/daemon/src/runtimes/`; the JSON-RPC transports live under `apps/daemon/src/agent-protocol/`; only `copilot-stream.ts` and the `server.ts` spawn/dispatch glue sit directly in `apps/daemon/src/`.
+
 ```
-apps/daemon/
-├── base.ts                 # shared interface + utility helpers
-├── claude-code/
-│   ├── adapter.ts
-│   ├── stream-parser.ts    # JSON-lines → AgentEvent
-│   └── detect.ts
-├── api-fallback/
-│   ├── adapter.ts
-│   ├── tool-loop.ts        # the minimal tool-use loop
-│   └── tools.ts            # Read/Write/Edit implementations
-├── codex/                  # Phase 1
-├── cursor-agent/           # Phase 1
-├── gemini-cli/             # Phase 2
-├── opencode/               # Phase 2
-└── openclaw/               # Phase 2
+apps/daemon/src/
+├── agents.ts               # public barrel — re-exports AGENT_DEFS / getAgentDef / detectAgents / … from runtimes/ (defines nothing)
+├── runtimes/
+│   ├── types.ts            # the RuntimeAgentDef contract (the data spec) + shared runtime types
+│   ├── registry.ts         # BASE_AGENT_DEFS array → AGENT_DEFS + unique-id guard + getAgentDef()
+│   ├── defs/               # one object literal per CLI — the file you add for a new agent
+│   │   ├── claude.ts
+│   │   ├── codex.ts
+│   │   ├── cursor-agent.ts
+│   │   ├── devin.ts
+│   │   ├── …               # ~two dozen defs (opencode, hermes, qoder, copilot,
+│   │   │                   #   amp, pi, kiro, kilo, vibe, deepseek, aider, antigravity, qwen,
+│   │   │                   #   grok-build, kimi, reasonix, codebuddy, trae-cli, …)
+│   │   └── shared.ts       # helpers reused across defs (not a registered agent)
+│   ├── detection.ts        # generic PATH-scan + config-probe over every def (detectAgents / …Stream)
+│   ├── capabilities.ts     # derives the UI capability map from def fields
+│   ├── executables.ts      # PATH resolution     · resolution.ts — bin resolution
+│   ├── launch.ts           # generic launch descriptor (resolveAgentLaunch / applyAgentLaunchEnv)
+│   ├── invocation.ts       # generic argv/prompt invocation from a def's buildArgs
+│   ├── env.ts              # per-agent spawn env  · mcp.ts — external-MCP injection per def
+│   ├── models.ts           # live/fallback models · prompt-budget.ts — argv size guards
+│   ├── local-profiles.ts   # user-defined local agent profiles merged into AGENT_DEFS
+│   ├── claude-stream.ts    # streamFormat="claude-stream-json": stream-json JSONL → UI events
+│   ├── qoder-stream.ts     # streamFormat="qoder-stream-json": stream-json JSONL → UI events
+│   ├── json-event-stream.ts# streamFormat="json-event-stream": generic JSONL → UI events
+│   └── plain-stream.ts     # streamFormat="plain": scans stdout for <artifact> blocks → project files
+├── copilot-stream.ts       # streamFormat="copilot-stream-json" — the one stream parser that sits flat at src/
+├── agent-protocol/         # JSON-RPC transports, dispatched via agent-protocol/index.ts (attachAcpSession / attachPiRpcSession)
+│   ├── index.ts            # barrel: attachAcpSession / attachPiRpcSession / mapPiRpcEvent
+│   ├── acp/                # streamFormat="acp-json-rpc": shared ACP transport (devin / kimi / kilo / kiro / vibe / hermes)
+│   ├── pi-rpc/             # streamFormat="pi-rpc": pi's JSON-RPC-over-stdio transport
+│   └── core/               # shared JSON-line stream helpers
+└── server.ts               # spawn pipeline + stream dispatch: routes def.streamFormat/eventParser to a parser
 ```
 
-Each adapter is a separate module so community contributions can add new ones without touching core daemon code.
+The engine is agent-agnostic: it iterates `AGENT_DEFS` and reads fields. A community contribution adds a new agent by dropping one `runtimes/defs/<cli>.ts` and appending it to `BASE_AGENT_DEFS` — detection, launch, invocation, and (for an existing `streamFormat`) parsing come for free, with no change to core daemon code.
 
 ## 12. Open questions
 
